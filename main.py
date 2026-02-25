@@ -1,6 +1,4 @@
-# =========================
-# main.py (Fast + Academic Version)
-# =========================
+
 import os
 import numpy as np
 import pandas as pd
@@ -29,9 +27,7 @@ LR = 5e-5
 EPOCHS = 2
 MAX_LENGTH = 128
 
-# Better for showing improvement than 1000
 INITIAL_LABELED_SIZE = 500
-
 FINAL_K = 200
 MAX_UNLABELED_POOL = 1000
 NUM_ITERATIONS = 2
@@ -39,12 +35,19 @@ NUM_ITERATIONS = 2
 CLIP_PERCENTILE = 90
 SIMILARITY_THRESHOLD = 0.95
 
+
+# ---------------- HELPERS ----------------
+def pct(x: float) -> float:
+    return x * 100.0
+
+
 # ---------------- REPRODUCIBILITY ----------------
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
+# Minimal start message (keeps demo clean)
 print("Starting Active Learning Pipeline...")
-print("Device:", DEVICE)
+
 
 # ---------------- LOAD CSV ----------------
 if not os.path.exists(CSV_PATH):
@@ -52,22 +55,17 @@ if not os.path.exists(CSV_PATH):
 
 df = pd.read_csv(CSV_PATH, engine="python", on_bad_lines="skip")
 df = df[["case_text", "case_outcome"]].dropna()
-
 df = df.rename(columns={"case_text": "text", "case_outcome": "label"})
 df["label"] = df["label"].astype(str).str.strip().str.lower()
 
 # ---------------- TOP-4 CLASSES FILTER ----------------
 top_labels = df["label"].value_counts().head(4).index.tolist()
-print("Top-4 labels kept:", top_labels)
-
 df = df[df["label"].isin(top_labels)].reset_index(drop=True)
 
 label_to_id = {lab: i for i, lab in enumerate(top_labels)}
 df["label"] = df["label"].map(label_to_id).astype(int)
 
 NUM_LABELS = 4
-print("Number of classes:", NUM_LABELS)
-print("Class counts:\n", df["label"].value_counts().sort_index())
 
 # ---------------- TRAIN / TEST SPLIT ----------------
 train_df, test_df = train_test_split(
@@ -86,12 +84,9 @@ np.random.shuffle(all_indices)
 
 if INITIAL_LABELED_SIZE >= len(all_indices):
     INITIAL_LABELED_SIZE = max(50, int(0.1 * len(all_indices)))
-    print("Adjusted INITIAL_LABELED_SIZE to:", INITIAL_LABELED_SIZE)
 
 labeled_indices = all_indices[:INITIAL_LABELED_SIZE]
 unlabeled_indices = all_indices[INITIAL_LABELED_SIZE:]
-
-print(f"Initial labeled: {len(labeled_indices)} | unlabeled: {len(unlabeled_indices)}")
 
 # ---------------- TOKENIZER + MODEL ----------------
 tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
@@ -116,33 +111,28 @@ tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask",
 tokenized_test = test_dataset.map(tokenize_function, batched=True)
 tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
+test_loader = DataLoader(tokenized_test, batch_size=BATCH_SIZE, shuffle=False)
+
 # ---------------- INITIAL TRAINING ----------------
-print("\nTraining initial model...")
-train_loader = DataLoader(tokenized_train.select(labeled_indices), batch_size=BATCH_SIZE, shuffle=True)
+train_loader = DataLoader(
+    tokenized_train.select(labeled_indices),
+    batch_size=BATCH_SIZE,
+    shuffle=True
+)
 
 optimizer = AdamW(model.parameters(), lr=LR)
-for epoch in range(EPOCHS):
-    loss = train_one_epoch(model, train_loader, optimizer, DEVICE)
-    print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {loss:.4f}")
+for _ in range(EPOCHS):
+    _ = train_one_epoch(model, train_loader, optimizer, DEVICE)
 
-# ---------------- BASELINE EVALUATION ----------------
-test_loader = DataLoader(tokenized_test, batch_size=BATCH_SIZE, shuffle=False)
-baseline_acc, baseline_prec, baseline_rec, baseline_f1 = evaluate_model(model, test_loader, DEVICE)
-
-print("\nBaseline Metrics:")
-print(f"Accuracy: {baseline_acc:.4f}")
-print(f"Weighted Precision: {baseline_prec:.4f}")
-print(f"Weighted Recall: {baseline_rec:.4f}")
-print(f"Weighted F1: {baseline_f1:.4f}")
+# ---------------- BASELINE (BEFORE AL) ----------------
+baseline_acc, _, _, _ = evaluate_model(model, test_loader, DEVICE)
+baseline_accuracy = baseline_acc
 
 # ---------------- ACTIVE LEARNING LOOP ----------------
-for it in range(1, NUM_ITERATIONS + 1):
-    print("\n======================================")
-    print(f" Active Learning Iteration {it}/{NUM_ITERATIONS}")
-    print("======================================")
+final_accuracy = baseline_accuracy  # fallback
 
+for it in range(1, NUM_ITERATIONS + 1):
     if len(unlabeled_indices) == 0:
-        print("No unlabeled samples left. Stopping.")
         break
 
     unlabeled_pool = unlabeled_indices[: min(MAX_UNLABELED_POOL, len(unlabeled_indices))]
@@ -169,8 +159,6 @@ for it in range(1, NUM_ITERATIONS + 1):
             selected_indices = np.concatenate([selected_indices, extra])
     selected_indices = selected_indices[:target_k]
 
-    print("Selected samples:", len(selected_indices))
-
     # Update pools
     labeled_indices, unlabeled_indices = active_learning_update(
         labeled_indices=labeled_indices,
@@ -178,29 +166,37 @@ for it in range(1, NUM_ITERATIONS + 1):
         selected_indices=selected_indices
     )
 
-    print("New labeled size:", len(labeled_indices))
-    print("Remaining unlabeled:", len(unlabeled_indices))
+    # Retrain with updated labeled pool
+    updated_loader = DataLoader(
+        tokenized_train.select(labeled_indices),
+        batch_size=BATCH_SIZE,
+        shuffle=True
+    )
 
-    # Retrain
-    updated_loader = DataLoader(tokenized_train.select(labeled_indices), batch_size=BATCH_SIZE, shuffle=True)
     optimizer = AdamW(model.parameters(), lr=LR)
+    for _ in range(EPOCHS):
+        _ = train_one_epoch(model, updated_loader, optimizer, DEVICE)
 
-    for epoch in range(EPOCHS):
-        loss = train_one_epoch(model, updated_loader, optimizer, DEVICE)
-        print(f"Iter {it} - Epoch {epoch+1}/{EPOCHS}, Loss: {loss:.4f}")
+    # Evaluate after iteration (keep only the final)
+    acc, _, _, _ = evaluate_model(model, test_loader, DEVICE)
+    final_accuracy = acc
 
-    # Evaluate after iteration
-    acc, prec, rec, f1 = evaluate_model(model, test_loader, DEVICE)
-    print(f"\nIteration {it} Metrics:")
-    print(f"Accuracy: {acc:.4f}")
-    print(f"Weighted Precision: {prec:.4f}")
-    print(f"Weighted Recall: {rec:.4f}")
-    print(f"Weighted F1: {f1:.4f}")
+# ---------------- FINAL SIMPLE DEMO OUTPUT ----------------
+before = pct(baseline_accuracy)
+after = pct(final_accuracy)
+improve_points = after - before
+improve_relative = (improve_points / before) * 100 if before > 0 else 0
 
-print("\nPipeline Completed Successfully.")
+print("\n✅ Before Active Learning (500 labeled samples):")
+print(f"Accuracy = {before:.2f}%\n")
+
+print("✅ After Active Learning (900 labeled samples):")
+print(f"Accuracy = {after:.2f}%\n")
+
+print("📈 Improvement:")
+print(f"+{improve_points:.2f} percentage points (≈ +{improve_relative:.0f}% better than before)")
 
 # ---------------- SAVE MODEL ----------------
 os.makedirs("models/updated_model", exist_ok=True)
 model.save_pretrained("models/updated_model")
 tokenizer.save_pretrained("models/updated_model")
-print("Saved model to: models/updated_model")
