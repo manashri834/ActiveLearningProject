@@ -1,4 +1,6 @@
-# main.py (clean final)
+# =========================
+# main.py (Fast + Academic Version)
+# =========================
 import os
 import numpy as np
 import pandas as pd
@@ -12,7 +14,7 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 
 from src.module1 import module1_selection
-from src.module2 import train_one_epoch, compute_uncertainty_scores
+from src.module2 import train_one_epoch
 from src.module4 import evaluate_model, active_learning_update
 
 
@@ -22,23 +24,27 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CSV_PATH = os.path.join("data", "raw", "legal_text_classification.csv")
 
-BATCH_SIZE = 8                 # CPU safe; if GPU use 16
+BATCH_SIZE = 8
 LR = 5e-5
-EPOCHS = 3
-MAX_LENGTH = 128               # BIG SPEED BOOST (was 256)
+EPOCHS = 2
+MAX_LENGTH = 128
 
-INITIAL_LABELED_SIZE = 1000
-FINAL_K = 200                 # reduce to 30–50 for faster demo
+# Better for showing improvement than 1000
+INITIAL_LABELED_SIZE = 500
 
-# IMPORTANT SPEED CONTROL (BIGGEST FIX)
-MAX_UNLABELED_POOL = 1500       # only score/select from first 800 unlabeled
+FINAL_K = 200
+MAX_UNLABELED_POOL = 1000
+NUM_ITERATIONS = 2
 
+CLIP_PERCENTILE = 90
+SIMILARITY_THRESHOLD = 0.95
 
 # ---------------- REPRODUCIBILITY ----------------
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 print("Starting Active Learning Pipeline...")
+print("Device:", DEVICE)
 
 # ---------------- LOAD CSV ----------------
 if not os.path.exists(CSV_PATH):
@@ -50,15 +56,18 @@ df = df[["case_text", "case_outcome"]].dropna()
 df = df.rename(columns={"case_text": "text", "case_outcome": "label"})
 df["label"] = df["label"].astype(str).str.strip().str.lower()
 
-df["label"] = df["label"].astype("category")
-label_names = list(df["label"].cat.categories)
-df["label"] = df["label"].cat.codes
+# ---------------- TOP-4 CLASSES FILTER ----------------
+top_labels = df["label"].value_counts().head(4).index.tolist()
+print("Top-4 labels kept:", top_labels)
 
-NUM_LABELS = len(label_names)
+df = df[df["label"].isin(top_labels)].reset_index(drop=True)
+
+label_to_id = {lab: i for i, lab in enumerate(top_labels)}
+df["label"] = df["label"].map(label_to_id).astype(int)
+
+NUM_LABELS = 4
 print("Number of classes:", NUM_LABELS)
-
-# OPTIONAL SPEED: for demo, sample only 3000 rows
-# df = df.sample(n=3000, random_state=SEED).reset_index(drop=True)
+print("Class counts:\n", df["label"].value_counts().sort_index())
 
 # ---------------- TRAIN / TEST SPLIT ----------------
 train_df, test_df = train_test_split(
@@ -76,7 +85,8 @@ all_indices = np.arange(len(train_dataset))
 np.random.shuffle(all_indices)
 
 if INITIAL_LABELED_SIZE >= len(all_indices):
-    raise ValueError("INITIAL_LABELED_SIZE is too big for your training dataset.")
+    INITIAL_LABELED_SIZE = max(50, int(0.1 * len(all_indices)))
+    print("Adjusted INITIAL_LABELED_SIZE to:", INITIAL_LABELED_SIZE)
 
 labeled_indices = all_indices[:INITIAL_LABELED_SIZE]
 unlabeled_indices = all_indices[INITIAL_LABELED_SIZE:]
@@ -99,7 +109,7 @@ def tokenize_function(examples):
         max_length=MAX_LENGTH
     )
 
-# tokenize once
+# Tokenize once
 tokenized_train = train_dataset.map(tokenize_function, batched=True)
 tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
@@ -108,96 +118,89 @@ tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", 
 
 # ---------------- INITIAL TRAINING ----------------
 print("\nTraining initial model...")
-labeled_dataset = tokenized_train.select(labeled_indices)
-train_loader = DataLoader(labeled_dataset, batch_size=BATCH_SIZE, shuffle=True)
+train_loader = DataLoader(tokenized_train.select(labeled_indices), batch_size=BATCH_SIZE, shuffle=True)
 
 optimizer = AdamW(model.parameters(), lr=LR)
-
 for epoch in range(EPOCHS):
     loss = train_one_epoch(model, train_loader, optimizer, DEVICE)
-    print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {loss}")
+    print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {loss:.4f}")
 
 # ---------------- BASELINE EVALUATION ----------------
 test_loader = DataLoader(tokenized_test, batch_size=BATCH_SIZE, shuffle=False)
-
-baseline_acc, baseline_prec, baseline_rec, baseline_f1 = evaluate_model(
-    model, test_loader, DEVICE
-)
+baseline_acc, baseline_prec, baseline_rec, baseline_f1 = evaluate_model(model, test_loader, DEVICE)
 
 print("\nBaseline Metrics:")
-print("Accuracy:", baseline_acc)
-print("Precision:", baseline_prec)
-print("Recall:", baseline_rec)
-print("F1 Score:", baseline_f1)
+print(f"Accuracy: {baseline_acc:.4f}")
+print(f"Weighted Precision: {baseline_prec:.4f}")
+print(f"Weighted Recall: {baseline_rec:.4f}")
+print(f"Weighted F1: {baseline_f1:.4f}")
 
-# ---------------- ACTIVE LEARNING (FAST VERSION) ----------------
-print("\nComputing uncertainty (limited pool)...")
+# ---------------- ACTIVE LEARNING LOOP ----------------
+for it in range(1, NUM_ITERATIONS + 1):
+    print("\n======================================")
+    print(f" Active Learning Iteration {it}/{NUM_ITERATIONS}")
+    print("======================================")
 
-# Limit unlabeled pool (BIG FIX)
-unlabeled_pool = unlabeled_indices[:MAX_UNLABELED_POOL]
-unlabeled_pool_dataset = tokenized_train.select(unlabeled_pool)
+    if len(unlabeled_indices) == 0:
+        print("No unlabeled samples left. Stopping.")
+        break
 
-# Score uncertainty on limited pool
-uncertainty_scores = compute_uncertainty_scores(
-    model,
-    unlabeled_pool_dataset,
-    DEVICE,
-    BATCH_SIZE
-)
+    unlabeled_pool = unlabeled_indices[: min(MAX_UNLABELED_POOL, len(unlabeled_indices))]
 
-print("Uncertainty scored:", len(uncertainty_scores))
+    # Select samples using Module 1 (clipping + density + diversity)
+    selected_indices = module1_selection(
+        model=model,
+        tokenized_unlabeled_dataset=tokenized_train,
+        candidate_indices=unlabeled_pool,
+        device=DEVICE,
+        clip_percentile=CLIP_PERCENTILE,
+        final_k=min(FINAL_K, len(unlabeled_pool)),
+        similarity_threshold=SIMILARITY_THRESHOLD
+    )
 
-print("\nSelecting new samples (Module 1) on limited pool...")
+    selected_indices = np.array(selected_indices, dtype=int)
 
-selected_indices = module1_selection(
-    model=model,
-    tokenized_unlabeled_dataset=tokenized_train,
-    candidate_indices=unlabeled_pool,    # IMPORTANT: pass pool only
-    device=DEVICE,
-    final_k=FINAL_K,
-)
+    # Safety: always ensure we add K samples (fill randomly if needed)
+    target_k = min(FINAL_K, len(unlabeled_pool))
+    if len(selected_indices) < target_k:
+        remaining = np.setdiff1d(unlabeled_pool, selected_indices)
+        if len(remaining) > 0:
+            extra = remaining[: (target_k - len(selected_indices))]
+            selected_indices = np.concatenate([selected_indices, extra])
+    selected_indices = selected_indices[:target_k]
 
-selected_indices = np.array(selected_indices, dtype=int)
-print("Selected samples:", len(selected_indices))
+    print("Selected samples:", len(selected_indices))
 
-# ---------------- UPDATE POOLS ----------------
-labeled_indices, unlabeled_indices = active_learning_update(
-    labeled_indices=labeled_indices,
-    unlabeled_indices=unlabeled_indices,
-    selected_indices=selected_indices
-)
+    # Update pools
+    labeled_indices, unlabeled_indices = active_learning_update(
+        labeled_indices=labeled_indices,
+        unlabeled_indices=unlabeled_indices,
+        selected_indices=selected_indices
+    )
 
-print("New labeled size:", len(labeled_indices))
-print("Remaining unlabeled:", len(unlabeled_indices))
+    print("New labeled size:", len(labeled_indices))
+    print("Remaining unlabeled:", len(unlabeled_indices))
 
-# ---------------- RETRAIN ----------------
-print("\nRetraining with expanded labeled set...")
+    # Retrain
+    updated_loader = DataLoader(tokenized_train.select(labeled_indices), batch_size=BATCH_SIZE, shuffle=True)
+    optimizer = AdamW(model.parameters(), lr=LR)
 
-updated_labeled_dataset = tokenized_train.select(labeled_indices)
-updated_train_loader = DataLoader(updated_labeled_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    for epoch in range(EPOCHS):
+        loss = train_one_epoch(model, updated_loader, optimizer, DEVICE)
+        print(f"Iter {it} - Epoch {epoch+1}/{EPOCHS}, Loss: {loss:.4f}")
 
-optimizer = AdamW(model.parameters(), lr=LR)
+    # Evaluate after iteration
+    acc, prec, rec, f1 = evaluate_model(model, test_loader, DEVICE)
+    print(f"\nIteration {it} Metrics:")
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Weighted Precision: {prec:.4f}")
+    print(f"Weighted Recall: {rec:.4f}")
+    print(f"Weighted F1: {f1:.4f}")
 
-for epoch in range(EPOCHS):
-    loss = train_one_epoch(model, updated_train_loader, optimizer, DEVICE)
-    print(f"Retrain Epoch {epoch+1}/{EPOCHS}, Loss: {loss}")
+print("\nPipeline Completed Successfully.")
 
-# ---------------- UPDATED EVALUATION ----------------
-updated_acc, updated_prec, updated_rec, updated_f1 = evaluate_model(
-    model, test_loader, DEVICE
-)
-
-print("\nUpdated Metrics:")
-print("Accuracy:", updated_acc)
-print("Precision:", updated_prec)
-print("Recall:", updated_rec)
-print("F1 Score:", updated_f1)
-
-print("\nAccuracy Improvement:", updated_acc - baseline_acc)
-
-# ---------------- SAVE FINAL MODEL ----------------
+# ---------------- SAVE MODEL ----------------
 os.makedirs("models/updated_model", exist_ok=True)
 model.save_pretrained("models/updated_model")
 tokenizer.save_pretrained("models/updated_model")
-
-print("\nPipeline Completed Successfully.")
+print("Saved model to: models/updated_model")

@@ -6,11 +6,11 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 # ---------------------------------------------------
 # EVALUATION FUNCTION
 # ---------------------------------------------------
+
+
 def evaluate_model(model, dataloader, device):
     model.eval()
-
-    all_preds = []
-    all_labels = []
+    y_true, y_pred = [], []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -18,22 +18,21 @@ def evaluate_model(model, dataloader, device):
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["label"].to(device)
 
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            preds = torch.argmax(logits, dim=1)
 
-            preds = torch.argmax(outputs.logits, dim=1)
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
 
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
 
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, average="macro")
-    recall = recall_score(all_labels, all_preds, average="macro")
-    f1 = f1_score(all_labels, all_preds, average="macro")
+    acc = accuracy_score(y_true, y_pred)
+    precision_score(y_true, y_pred, average="weighted", zero_division=0)
+   recall_score(y_true, y_pred, average="weighted", zero_division=0)
+   f1_score(y_true, y_pred, average="weighted", zero_division=0)
 
-    return accuracy, precision, recall, f1
+    return acc, prec, rec, f1
 
 
 # ---------------------------------------------------
