@@ -23,9 +23,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = os.path.join("data", "raw", "pubmed_rct20k.csv")
 
 BATCH_SIZE = 8
-LR = 2e-5
-EPOCHS = 4           # slightly higher for stability
-MAX_LENGTH = 256
+LR = 5e-5
+EPOCHS = 3              # slightly higher for stability
+MAX_LENGTH = 128
 
 INITIAL_LABELED_SIZE = 500
 FINAL_K = 100           # less aggressive = more stable
@@ -87,15 +87,14 @@ df = df[["case_text", "case_outcome"]].dropna()
 df = df.rename(columns={"case_text": "text", "case_outcome": "label"})
 df["label"] = df["label"].astype(str).str.strip().str.lower()
 
+# ---------------- TOP-4 CLASSES FILTER ----------------
+top_labels = df["label"].value_counts().head(4).index.tolist()
+df = df[df["label"].isin(top_labels)].reset_index(drop=True)
 
-# Use ALL classes (5 for PubMed RCT20k)
-labels = sorted(df["label"].unique().tolist())
-label_to_id = {lab: i for i, lab in enumerate(labels)}
+label_to_id = {lab: i for i, lab in enumerate(top_labels)}
 df["label"] = df["label"].map(label_to_id).astype(int)
 
-NUM_LABELS = len(labels)
-print("Classes:", labels)
-print("NUM_LABELS:", NUM_LABELS)
+NUM_LABELS = len(top_labels)
 
 # ---------------- TRAIN / TEST SPLIT ----------------
 train_df, test_df = train_test_split(
@@ -119,11 +118,10 @@ labeled_indices = all_indices[:INITIAL_LABELED_SIZE]
 unlabeled_indices = all_indices[INITIAL_LABELED_SIZE:]
 
 # ---------------- TOKENIZER + MODEL ----------------
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
 
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-model = AutoModelForSequenceClassification.from_pretrained(
-    "bert-base-uncased",
+model = DistilBertForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased",
     num_labels=NUM_LABELS
 ).to(DEVICE)
 
