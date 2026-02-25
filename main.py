@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import pandas as pd
@@ -20,15 +19,16 @@ from src.module4 import evaluate_model, active_learning_update
 SEED = 42
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CSV_PATH = os.path.join("data", "raw", "legal_text_classification.csv")
+# ✅ Medical dataset CSV (clear name)
+CSV_PATH = os.path.join("data", "raw", "pubmed_rct20k.csv")
 
 BATCH_SIZE = 8
 LR = 5e-5
-EPOCHS = 2
+EPOCHS = 3              # slightly higher for stability
 MAX_LENGTH = 128
 
 INITIAL_LABELED_SIZE = 500
-FINAL_K = 200
+FINAL_K = 100           # less aggressive = more stable
 MAX_UNLABELED_POOL = 1000
 NUM_ITERATIONS = 2
 
@@ -41,13 +41,41 @@ def pct(x: float) -> float:
     return x * 100.0
 
 
+def ensure_medical_csv(csv_path: str):
+    """
+    If csv_path does not exist, download PubMed RCT 20k (medical) and save it in the format:
+      case_text, case_outcome
+    """
+    if os.path.exists(csv_path):
+        return
+
+    print("Medical CSV not found. Downloading PubMed RCT 20k dataset...")
+    from datasets import load_dataset  # imported here to avoid forcing dependency if already exists
+
+    ds = load_dataset("armanc/pubmed-rct20k")
+    train_df = pd.DataFrame(ds["train"])
+
+    # Convert into your expected format
+    train_df = train_df.rename(columns={"text": "case_text", "label": "case_outcome"})[
+        ["case_text", "case_outcome"]
+    ]
+
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    train_df.to_csv(csv_path, index=False)
+
+    print(f"✅ Medical dataset saved to: {csv_path}")
+    print(train_df["case_outcome"].value_counts())
+
+
 # ---------------- REPRODUCIBILITY ----------------
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# Minimal start message (keeps demo clean)
 print("Starting Active Learning Pipeline...")
+print("Device:", DEVICE)
 
+# ---------------- LOAD / CREATE MEDICAL CSV ----------------
+ensure_medical_csv(CSV_PATH)
 
 # ---------------- LOAD CSV ----------------
 if not os.path.exists(CSV_PATH):
@@ -55,6 +83,7 @@ if not os.path.exists(CSV_PATH):
 
 df = pd.read_csv(CSV_PATH, engine="python", on_bad_lines="skip")
 df = df[["case_text", "case_outcome"]].dropna()
+
 df = df.rename(columns={"case_text": "text", "case_outcome": "label"})
 df["label"] = df["label"].astype(str).str.strip().str.lower()
 
@@ -65,7 +94,7 @@ df = df[df["label"].isin(top_labels)].reset_index(drop=True)
 label_to_id = {lab: i for i, lab in enumerate(top_labels)}
 df["label"] = df["label"].map(label_to_id).astype(int)
 
-NUM_LABELS = 4
+NUM_LABELS = len(top_labels)
 
 # ---------------- TRAIN / TEST SPLIT ----------------
 train_df, test_df = train_test_split(
@@ -137,7 +166,6 @@ for it in range(1, NUM_ITERATIONS + 1):
 
     unlabeled_pool = unlabeled_indices[: min(MAX_UNLABELED_POOL, len(unlabeled_indices))]
 
-    # Select samples using Module 1 (clipping + density + diversity)
     selected_indices = module1_selection(
         model=model,
         tokenized_unlabeled_dataset=tokenized_train,
@@ -150,7 +178,7 @@ for it in range(1, NUM_ITERATIONS + 1):
 
     selected_indices = np.array(selected_indices, dtype=int)
 
-    # Safety: always ensure we add K samples (fill randomly if needed)
+    # Ensure we always add K samples
     target_k = min(FINAL_K, len(unlabeled_pool))
     if len(selected_indices) < target_k:
         remaining = np.setdiff1d(unlabeled_pool, selected_indices)
@@ -159,14 +187,12 @@ for it in range(1, NUM_ITERATIONS + 1):
             selected_indices = np.concatenate([selected_indices, extra])
     selected_indices = selected_indices[:target_k]
 
-    # Update pools
     labeled_indices, unlabeled_indices = active_learning_update(
         labeled_indices=labeled_indices,
         unlabeled_indices=unlabeled_indices,
         selected_indices=selected_indices
     )
 
-    # Retrain with updated labeled pool
     updated_loader = DataLoader(
         tokenized_train.select(labeled_indices),
         batch_size=BATCH_SIZE,
@@ -177,7 +203,6 @@ for it in range(1, NUM_ITERATIONS + 1):
     for _ in range(EPOCHS):
         _ = train_one_epoch(model, updated_loader, optimizer, DEVICE)
 
-    # Evaluate after iteration (keep only the final)
     acc, _, _, _ = evaluate_model(model, test_loader, DEVICE)
     final_accuracy = acc
 
@@ -187,6 +212,9 @@ after = pct(final_accuracy)
 improve_points = after - before
 improve_relative = (improve_points / before) * 100 if before > 0 else 0
 
+sign_pts = "+" if improve_points >= 0 else ""
+sign_rel = "+" if improve_relative >= 0 else ""
+
 print("\n✅ Before Active Learning (500 labeled samples):")
 print(f"Accuracy = {before:.2f}%\n")
 
@@ -194,7 +222,7 @@ print("✅ After Active Learning (900 labeled samples):")
 print(f"Accuracy = {after:.2f}%\n")
 
 print("📈 Improvement:")
-print(f"+{improve_points:.2f} percentage points (≈ +{improve_relative:.0f}% better than before)")
+print(f"{sign_pts}{improve_points:.2f} percentage points (≈ {sign_rel}{improve_relative:.0f}% vs before)")
 
 # ---------------- SAVE MODEL ----------------
 os.makedirs("models/updated_model", exist_ok=True)
