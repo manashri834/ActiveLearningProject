@@ -7,10 +7,10 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 # EVALUATION FUNCTION
 # ---------------------------------------------------
 
-
 def evaluate_model(model, dataloader, device):
     model.eval()
-    y_true, y_pred = [], []
+    y_true = []
+    y_pred = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -18,7 +18,12 @@ def evaluate_model(model, dataloader, device):
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["label"].to(device)
 
-            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+
+            logits = outputs.logits
             preds = torch.argmax(logits, dim=1)
 
             y_true.extend(labels.cpu().numpy())
@@ -28,9 +33,9 @@ def evaluate_model(model, dataloader, device):
     y_pred = np.array(y_pred)
 
     acc = accuracy_score(y_true, y_pred)
-    precision_score(y_true, y_pred, average="weighted", zero_division=0)
-   recall_score(y_true, y_pred, average="weighted", zero_division=0)
-   f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    prec = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+    rec = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+    f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
 
     return acc, prec, rec, f1
 
@@ -38,11 +43,10 @@ def evaluate_model(model, dataloader, device):
 # ---------------------------------------------------
 # ACTIVE LEARNING POOL UPDATE
 # ---------------------------------------------------
+
 def active_learning_update(labeled_indices, unlabeled_indices, selected_indices):
 
     new_labeled = np.concatenate([labeled_indices, selected_indices])
     new_unlabeled = np.setdiff1d(unlabeled_indices, selected_indices)
-
-    print("New labeled size:", len(new_labeled))
 
     return new_labeled, new_unlabeled
