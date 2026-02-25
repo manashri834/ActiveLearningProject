@@ -23,9 +23,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = os.path.join("data", "raw", "pubmed_rct20k.csv")
 
 BATCH_SIZE = 8
-LR = 5e-5
-EPOCHS = 5            # slightly higher for stability
-MAX_LENGTH = 128
+LR = 2e-5
+EPOCHS = 4           # slightly higher for stability
+MAX_LENGTH = 256
 
 INITIAL_LABELED_SIZE = 500
 FINAL_K = 100           # less aggressive = more stable
