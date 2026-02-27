@@ -89,6 +89,8 @@ df["label"] = df["label"].astype(str).str.strip().str.lower()
 
 # ---------------- TOP-4 CLASSES FILTER ----------------
 top_labels = df["label"].value_counts().head(4).index.tolist()
+print("Top 4 labels:", top_labels)
+print("Label mapping:", {lab:i for i, lab in enumerate(top_labels)})
 df = df[df["label"].isin(top_labels)].reset_index(drop=True)
 
 label_to_id = {lab: i for i, lab in enumerate(top_labels)}
